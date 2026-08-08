@@ -82,7 +82,7 @@ export function createApp(service: PaymentService): Express {
     if (err instanceof ZodError) {
       res.status(400).json({
         error: "validation_error",
-        message: "Request body is invalid",
+        message: "Request is invalid",
         details: err.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
       });
       return;
