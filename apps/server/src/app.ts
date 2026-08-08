@@ -1,11 +1,32 @@
 import cors from "cors";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { ZodError } from "zod";
-import { createPaymentSchema, PaymentError, PaymentService } from "./payments.js";
+import {
+  createPaymentSchema,
+  listPaymentsQuerySchema,
+  PaymentError,
+  PaymentService,
+  refundPaymentSchema,
+} from "./payments.js";
+
+const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
+
+function readIdempotencyKey(req: Request): string | undefined {
+  const key = req.header("Idempotency-Key")?.trim();
+  if (!key) return undefined;
+  if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    throw new PaymentError(
+      400,
+      `Idempotency-Key must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`,
+      "invalid_idempotency_key",
+    );
+  }
+  return key;
+}
 
 export function createApp(service: PaymentService): Express {
   const app = express();
-  app.use(cors());
+  app.use(cors({ exposedHeaders: ["Idempotency-Replayed"] }));
   app.use(express.json());
 
   const api = express.Router();
@@ -18,15 +39,20 @@ export function createApp(service: PaymentService): Express {
     res.json(service.stats());
   });
 
-  api.get("/payments", (_req, res) => {
-    res.json({ payments: service.list() });
+  api.get("/payments", (req, res, next) => {
+    try {
+      res.json(service.list(listPaymentsQuerySchema.parse(req.query)));
+    } catch (err) {
+      next(err);
+    }
   });
 
   api.post("/payments", (req, res, next) => {
     try {
+      const key = readIdempotencyKey(req);
       const input = createPaymentSchema.parse(req.body);
-      const payment = service.create(input);
-      res.status(201).json(payment);
+      const { payment, replayed } = service.create(input, key ? { key } : undefined);
+      res.status(201).set("Idempotency-Replayed", String(replayed)).json(payment);
     } catch (err) {
       next(err);
     }
@@ -34,7 +60,7 @@ export function createApp(service: PaymentService): Express {
 
   api.get("/payments/:id", (req, res, next) => {
     try {
-      res.json(service.get(req.params.id));
+      res.json(service.getDetail(req.params.id));
     } catch (err) {
       next(err);
     }
@@ -42,7 +68,8 @@ export function createApp(service: PaymentService): Express {
 
   api.post("/payments/:id/refund", (req, res, next) => {
     try {
-      res.json(service.refund(req.params.id));
+      const input = refundPaymentSchema.parse(req.body ?? {});
+      res.json(service.refund(req.params.id, input));
     } catch (err) {
       next(err);
     }

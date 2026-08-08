@@ -4,15 +4,26 @@ import {
   fetchPayments,
   fetchStats,
   formatMoney,
-  refundPayment,
   type Payment,
   type PaymentStats,
 } from "./api.js";
+import { PaymentDrawer } from "./PaymentDrawer.js";
+import { StatusBadge } from "./StatusBadge.js";
+
+const PAGE_SIZE = 8;
 
 const TEST_CARDS = [
   { label: "Visa — succeeds", value: "4242 4242 4242 4242" },
   { label: "Visa — declined", value: "4000 0000 0000 0002" },
   { label: "Visa — insufficient funds", value: "4000 0000 0000 9995" },
+];
+
+const STATUS_FILTERS = [
+  { label: "All", value: "" },
+  { label: "Succeeded", value: "succeeded" },
+  { label: "Partially refunded", value: "partially_refunded" },
+  { label: "Refunded", value: "refunded" },
+  { label: "Declined", value: "declined" },
 ];
 
 interface FormState {
@@ -33,23 +44,43 @@ const INITIAL_FORM: FormState = {
   cardNumber: "4242 4242 4242 4242",
 };
 
-function StatusBadge({ status }: { status: Payment["status"] }) {
-  return <span className={`badge badge-${status}`}>{status}</span>;
-}
-
 export function App() {
   const [form, setForm] = useState<FormState>(INITIAL_FORM);
   const [payments, setPayments] = useState<Payment[]>([]);
+  const [total, setTotal] = useState(0);
   const [stats, setStats] = useState<PaymentStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [status, setStatus] = useState("");
+  const [offset, setOffset] = useState(0);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  useEffect(() => {
+    setOffset(0);
+  }, [debouncedSearch, status]);
 
   const refresh = useCallback(async () => {
-    const [nextPayments, nextStats] = await Promise.all([fetchPayments(), fetchStats()]);
-    setPayments(nextPayments);
+    const [page, nextStats] = await Promise.all([
+      fetchPayments({ q: debouncedSearch, status, limit: PAGE_SIZE, offset }),
+      fetchStats(),
+    ]);
+    // A page can fall off the end when filters narrow the result set.
+    if (page.total > 0 && page.offset >= page.total) {
+      setOffset((Math.ceil(page.total / PAGE_SIZE) - 1) * PAGE_SIZE);
+      return;
+    }
+    setPayments(page.payments);
+    setTotal(page.total);
     setStats(nextStats);
-  }, []);
+  }, [debouncedSearch, status, offset]);
 
   useEffect(() => {
     refresh().catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
@@ -86,16 +117,12 @@ export function App() {
     }
   };
 
-  const onRefund = async (id: string) => {
+  const onRefunded = async (message: string) => {
     setError(null);
-    setNotice(null);
-    try {
-      await refundPayment(id);
-      setNotice(`Refunded ${id}.`);
-      await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+    setNotice(message);
+    await refresh().catch((err: unknown) =>
+      setError(err instanceof Error ? err.message : String(err)),
+    );
   };
 
   const currency = stats?.currency ?? "usd";
@@ -103,11 +130,16 @@ export function App() {
     () => [
       { label: "Net volume", value: formatMoney(stats?.netVolume ?? 0, currency) },
       { label: "Gross volume", value: formatMoney(stats?.grossVolume ?? 0, currency) },
+      { label: "Refunded", value: formatMoney(stats?.refundedVolume ?? 0, currency) },
       { label: "Payments", value: String(stats?.count ?? 0) },
       { label: "Declined", value: String(stats?.declinedCount ?? 0) },
     ],
     [stats, currency],
   );
+
+  const filtering = debouncedSearch !== "" || status !== "";
+  const rangeStart = total === 0 ? 0 : offset + 1;
+  const rangeEnd = Math.min(offset + PAGE_SIZE, total);
 
   return (
     <div className="page">
@@ -181,48 +213,118 @@ export function App() {
         </section>
 
         <section className="panel">
-          <h2>Transactions</h2>
+          <div className="panel-head">
+            <h2>Transactions</h2>
+            <input
+              className="search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search name, email, description or id"
+              aria-label="Search transactions"
+            />
+          </div>
+
+          <div className="filters">
+            {STATUS_FILTERS.map((filter) => (
+              <button
+                key={filter.value || "all"}
+                type="button"
+                className={`chip ${status === filter.value ? "chip-active" : ""}`}
+                onClick={() => setStatus(filter.value)}
+              >
+                {filter.label}
+              </button>
+            ))}
+          </div>
+
           {payments.length === 0 ? (
-            <p className="empty">No payments yet. Charge a card to get started.</p>
+            <p className="empty">
+              {filtering
+                ? "No payments match these filters."
+                : "No payments yet. Charge a card to get started."}
+            </p>
           ) : (
-            <table className="txns">
-              <thead>
-                <tr>
-                  <th>Customer</th>
-                  <th>Amount</th>
-                  <th>Card</th>
-                  <th>Status</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {payments.map((p) => (
-                  <tr key={p.id}>
-                    <td>
-                      <div className="cust-name">{p.customerName}</div>
-                      <div className="cust-sub">{p.description || p.customerEmail}</div>
-                    </td>
-                    <td>{formatMoney(p.amount, p.currency)}</td>
-                    <td className="mono">
-                      {p.cardBrand} ···· {p.cardLast4}
-                    </td>
-                    <td>
-                      <StatusBadge status={p.status} />
-                    </td>
-                    <td>
-                      {p.status === "succeeded" && (
-                        <button className="refund" onClick={() => onRefund(p.id)}>
-                          Refund
-                        </button>
-                      )}
-                    </td>
+            <>
+              <table className="txns">
+                <thead>
+                  <tr>
+                    <th>Customer</th>
+                    <th>Amount</th>
+                    <th>Card</th>
+                    <th>Status</th>
+                    <th />
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {payments.map((p) => (
+                    <tr key={p.id} className="txn-row" onClick={() => setSelectedId(p.id)}>
+                      <td>
+                        <div className="cust-name">{p.customerName}</div>
+                        <div className="cust-sub">{p.description || p.customerEmail}</div>
+                      </td>
+                      <td>
+                        <div>{formatMoney(p.amount, p.currency)}</div>
+                        {p.amountRefunded > 0 && (
+                          <div className="cust-sub">
+                            −{formatMoney(p.amountRefunded, p.currency)} refunded
+                          </div>
+                        )}
+                      </td>
+                      <td className="mono">
+                        {p.cardBrand} ···· {p.cardLast4}
+                      </td>
+                      <td>
+                        <StatusBadge status={p.status} />
+                      </td>
+                      <td>
+                        <button
+                          className="refund"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedId(p.id);
+                          }}
+                        >
+                          Details
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <div className="pager">
+                <span className="pager-range">
+                  Showing {rangeStart}–{rangeEnd} of {total}
+                </span>
+                <div className="pager-buttons">
+                  <button
+                    className="refund"
+                    disabled={offset === 0}
+                    onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                  >
+                    Previous
+                  </button>
+                  <button
+                    className="refund"
+                    disabled={offset + PAGE_SIZE >= total}
+                    onClick={() => setOffset(offset + PAGE_SIZE)}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            </>
           )}
         </section>
       </div>
+
+      {selectedId && (
+        <PaymentDrawer
+          paymentId={selectedId}
+          onClose={() => setSelectedId(null)}
+          onRefunded={onRefunded}
+        />
+      )}
     </div>
   );
 }

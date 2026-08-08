@@ -54,10 +54,10 @@ Base URL: `http://localhost:4000/api`
 | --- | --- | --- |
 | `GET` | `/health` | Service health check |
 | `GET` | `/stats` | Aggregate volume / counts |
-| `GET` | `/payments` | List payments (newest first) |
+| `GET` | `/payments` | List payments (newest first, searchable and paginated) |
 | `POST` | `/payments` | Create (process) a payment |
-| `GET` | `/payments/:id` | Fetch a single payment |
-| `POST` | `/payments/:id/refund` | Refund a succeeded payment |
+| `GET` | `/payments/:id` | Fetch a payment with its refunds and event timeline |
+| `POST` | `/payments/:id/refund` | Refund a payment in full or in part |
 
 ### Create a payment
 
@@ -77,6 +77,42 @@ curl -s http://localhost:4000/api/payments \
 `amount` is in the currency's minor unit (cents). Card numbers are validated
 with the Luhn algorithm.
 
+Send an `Idempotency-Key` header to make retries safe: the first request with a
+given key stores its result, and any later request with the same key returns
+that original payment instead of charging again. The response carries
+`Idempotency-Replayed: true` when it is a replay. Reusing a key with different
+parameters is rejected with `409 idempotency_key_reuse`.
+
+```bash
+curl -s http://localhost:4000/api/payments \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-1234' \
+  -d '{ "amount": 2500, "customerName": "Ada Lovelace",
+        "customerEmail": "ada@example.com", "cardNumber": "4242424242424242" }'
+```
+
+### List, search and paginate
+
+`GET /payments` accepts `status`, `q`, `limit` (1–100, default 25) and `offset`,
+and responds with `{ payments, total, limit, offset }`. `q` matches the customer
+name, email, description or payment id.
+
+```bash
+curl -s 'http://localhost:4000/api/payments?status=partially_refunded&q=ada&limit=10&offset=0'
+```
+
+### Refunds
+
+`POST /payments/:id/refund` refunds the whole remaining balance when no body is
+sent, or a partial amount with `{ "amount": 1000, "reason": "goodwill" }`. A
+payment moves to `partially_refunded` while a balance remains and to `refunded`
+once it reaches zero. Refunding more than the remaining balance returns
+`400 refund_amount_too_large`, and declined payments cannot be refunded.
+
+Every payment carries an append-only event timeline (`payment.created`,
+`payment.succeeded`, `payment.declined`, `refund.created`, `payment.refunded`),
+returned alongside the individual refunds by `GET /payments/:id`.
+
 ### Simulated test cards
 
 | Card number | Outcome |
@@ -90,3 +126,7 @@ with the Luhn algorithm.
 
 The server persists payments to SQLite at `apps/server/data/cloud-pay.sqlite`
 (override with `CLOUD_PAY_DB`). Tests use an in-memory database.
+
+Tables: `payments`, `refunds` (one row per refund), `payment_events` (the
+timeline) and `idempotency_keys`. The schema is created on boot and migrated
+forward in place, so an existing database file keeps working across upgrades.
