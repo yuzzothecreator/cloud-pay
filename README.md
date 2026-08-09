@@ -1,14 +1,16 @@
 # cloud-pay
 
-A small, self-contained **payments demo** built as an npm-workspaces monorepo.
-It processes simulated card payments (no external payment network required) so
-the full stack can run entirely offline in a development environment.
+A self-contained **payments platform demo** built as an npm-workspaces monorepo.
+It simulates card processing (no external payment network) so the full stack
+runs offline in a development environment — with customers, authorize/capture,
+refunds, disputes, signed webhooks, API keys, analytics and a multi-page
+dashboard.
 
 ## Stack
 
 | Part | Tech |
 | --- | --- |
-| `apps/server` | Node.js + Express + TypeScript, SQLite (`better-sqlite3`), Zod validation |
+| `apps/server` | Node.js + Express + TypeScript, SQLite (`better-sqlite3`), Zod |
 | `apps/web` | React + Vite + TypeScript |
 | Tests | Vitest + Supertest (server) |
 | Lint | ESLint (flat config) + typescript-eslint |
@@ -25,39 +27,68 @@ npm install          # install all workspaces
 npm run dev          # start API (:4000) and web UI (:5173) together
 ```
 
-Then open http://localhost:5173. The Vite dev server proxies `/api` to the
-API server on port 4000.
+Open http://localhost:5173. The Vite dev server proxies `/api` to port 4000.
+
+On first boot the API seeds a sample ledger (customers, payments, an open
+dispute, a webhook endpoint and an API key). Disable with `CLOUD_PAY_SEED=0`.
 
 ## Common commands
 
 ```bash
-npm run dev          # run server + web in parallel (dev mode)
+npm run dev          # run server + web in parallel
 npm run build        # type-check and build server + web
-npm test             # run the server test suite (Vitest)
+npm test             # server test suite (Vitest)
 npm run lint         # lint the whole repo
 npm run typecheck    # type-check every workspace
 ```
 
-Run a single workspace directly:
+## Dashboard
 
-```bash
-npm run dev  --workspace apps/server
-npm run dev  --workspace apps/web
-npm test     --workspace apps/server
-```
+Hash-routed pages in the web app:
+
+| Page | What it does |
+| --- | --- |
+| Payments | Charge / authorise cards, search, filter, capture, refund, dispute, CSV export |
+| Customers | Customer directory with lifetime value and payment history |
+| Disputes | Chargeback workflow (`needs_response` → `under_review` → `won`/`lost`) |
+| Webhooks | Endpoints, HMAC secrets, delivery log and retries |
+| Analytics | Daily volume chart, top customers, status breakdown |
+| Settings | API key minting / revocation and test-card reference |
 
 ## API
 
 Base URL: `http://localhost:4000/api`
 
+### Core
+
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | Service health check |
+| `GET` | `/health` | Health check |
 | `GET` | `/stats` | Aggregate volume / counts |
-| `GET` | `/payments` | List payments (newest first, searchable and paginated) |
-| `POST` | `/payments` | Create (process) a payment |
-| `GET` | `/payments/:id` | Fetch a payment with its refunds and event timeline |
-| `POST` | `/payments/:id/refund` | Refund a payment in full or in part |
+| `GET` | `/analytics?days=14` | Daily series + top customers |
+| `GET` | `/payments` | List (`status`, `q`, `customerId`, `limit`, `offset`) |
+| `GET` | `/payments/export.csv` | CSV export of the ledger |
+| `POST` | `/payments` | Create / process a payment |
+| `GET` | `/payments/:id` | Detail with refunds + timeline |
+| `POST` | `/payments/:id/refund` | Full or partial refund |
+| `POST` | `/payments/:id/capture` | Capture an authorised payment |
+| `POST` | `/payments/:id/cancel` | Release an authorisation |
+| `POST` | `/payments/:id/disputes` | Open a dispute |
+
+### Customers, disputes, webhooks, keys
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET`/`POST` | `/customers` | List / upsert customers |
+| `GET` | `/customers/:id` | Customer detail |
+| `GET` | `/disputes` | List disputes |
+| `GET`/`PATCH` | `/disputes/:id` | Fetch / update dispute status |
+| `GET`/`POST` | `/webhooks/endpoints` | List / create endpoints |
+| `PATCH`/`DELETE` | `/webhooks/endpoints/:id` | Update / delete endpoint |
+| `GET` | `/webhooks/deliveries` | Delivery log |
+| `POST` | `/webhooks/deliveries/:id/retry` | Retry a failed delivery |
+| `GET`/`POST` | `/api-keys` | List / create keys |
+| `POST` | `/api-keys/:id/revoke` | Revoke a key |
 
 ### Create a payment
 
@@ -70,48 +101,58 @@ curl -s http://localhost:4000/api/payments \
     "description": "Pro plan",
     "customerName": "Ada Lovelace",
     "customerEmail": "ada@example.com",
-    "cardNumber": "4242424242424242"
+    "cardNumber": "4242424242424242",
+    "captureMethod": "automatic",
+    "metadata": { "orderId": "ord_1" },
+    "statementDescriptor": "CLOUDPAY*PRO"
   }'
 ```
 
-`amount` is in the currency's minor unit (cents). Card numbers are validated
-with the Luhn algorithm.
+`amount` is in minor units (cents). Cards are Luhn-validated. Customers are
+upserted by email and linked onto the payment.
 
-Send an `Idempotency-Key` header to make retries safe: the first request with a
-given key stores its result, and any later request with the same key returns
-that original payment instead of charging again. The response carries
-`Idempotency-Replayed: true` when it is a replay. Reusing a key with different
-parameters is rejected with `409 idempotency_key_reuse`.
+Send `Idempotency-Key` to make retries safe. Replays return
+`Idempotency-Replayed: true`. Reusing a key with different parameters yields
+`409 idempotency_key_reuse`.
+
+### Authorize & capture
 
 ```bash
+# Authorise only
 curl -s http://localhost:4000/api/payments \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: order-1234' \
-  -d '{ "amount": 2500, "customerName": "Ada Lovelace",
-        "customerEmail": "ada@example.com", "cardNumber": "4242424242424242" }'
+  -d '{ ..., "captureMethod": "manual" }'
+
+# Capture (optionally less than authorised)
+curl -s http://localhost:4000/api/payments/pay_xxx/capture \
+  -H 'Content-Type: application/json' \
+  -d '{ "amount": 2000 }'
+
+# Or release the hold
+curl -s -X POST http://localhost:4000/api/payments/pay_xxx/cancel
 ```
 
-### List, search and paginate
+### Webhooks
 
-`GET /payments` accepts `status`, `q`, `limit` (1–100, default 25) and `offset`,
-and responds with `{ payments, total, limit, offset }`. `q` matches the customer
-name, email, description or payment id.
+Endpoints receive JSON POSTs signed with HMAC-SHA256:
+
+```
+X-Cloud-Pay-Signature: t=<unix>,v1=<hex>
+```
+
+where `v1 = HMAC_SHA256(secret, "{t}.{body}")`. Set
+`CLOUD_PAY_WEBHOOK_AUTO_DELIVER=1` to deliver immediately in the API process
+(off by default so boot seed does not hit the network).
+
+### API keys
 
 ```bash
-curl -s 'http://localhost:4000/api/payments?status=partially_refunded&q=ada&limit=10&offset=0'
+curl -s http://localhost:4000/api/stats \
+  -H 'Authorization: Bearer cp_live_...'
 ```
 
-### Refunds
-
-`POST /payments/:id/refund` refunds the whole remaining balance when no body is
-sent, or a partial amount with `{ "amount": 1000, "reason": "goodwill" }`. A
-payment moves to `partially_refunded` while a balance remains and to `refunded`
-once it reaches zero. Refunding more than the remaining balance returns
-`400 refund_amount_too_large`, and declined payments cannot be refunded.
-
-Every payment carries an append-only event timeline (`payment.created`,
-`payment.succeeded`, `payment.declined`, `refund.created`, `payment.refunded`),
-returned alongside the individual refunds by `GET /payments/:id`.
+Optional auth: when a Bearer token is present it is validated. Set
+`CLOUD_PAY_REQUIRE_AUTH=1` to reject unauthenticated requests (except `/health`).
 
 ### Simulated test cards
 
@@ -121,12 +162,24 @@ returned alongside the individual refunds by `GET /payments/:id`.
 | `4000 0000 0000 0002` | Declined (`card_declined`) |
 | `4000 0000 0000 9995` | Declined (`insufficient_funds`) |
 | `4000 0000 0000 0069` | Declined (`expired_card`) |
+| `4000 0000 0000 0119` | Declined (`processing_error`) |
+| `4000 0000 0000 0259` | Declined (`lost_card`) |
 
 ## Data
 
-The server persists payments to SQLite at `apps/server/data/cloud-pay.sqlite`
-(override with `CLOUD_PAY_DB`). Tests use an in-memory database.
+SQLite at `apps/server/data/cloud-pay.sqlite` (override with `CLOUD_PAY_DB`).
+Tests use an in-memory database.
 
-Tables: `payments`, `refunds` (one row per refund), `payment_events` (the
-timeline) and `idempotency_keys`. The schema is created on boot and migrated
-forward in place, so an existing database file keeps working across upgrades.
+Tables: `customers`, `payments`, `refunds`, `payment_events`, `idempotency_keys`,
+`disputes`, `webhook_endpoints`, `webhook_deliveries`, `api_keys`,
+`platform_events`. Schema migrates forward in place across upgrades.
+
+## Environment
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PORT` | `4000` | API port |
+| `CLOUD_PAY_DB` | `apps/server/data/cloud-pay.sqlite` | SQLite path |
+| `CLOUD_PAY_SEED` | on | Seed demo data when the ledger is empty |
+| `CLOUD_PAY_REQUIRE_AUTH` | off | Require API keys on `/api/*` |
+| `CLOUD_PAY_WEBHOOK_AUTO_DELIVER` | off | Deliver webhooks inline |

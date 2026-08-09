@@ -1,13 +1,12 @@
 import SQLite from "better-sqlite3";
-import type Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createApp } from "../src/app.js";
 import { openDatabase } from "../src/db.js";
 import { isLuhnValid, PaymentService } from "../src/payments.js";
+import { closeContext, createTestContext } from "./helpers.js";
 
 const VISA = "4242424242424242";
 const DECLINE = "4000000000000002";
@@ -21,16 +20,14 @@ describe("card helpers", () => {
 });
 
 describe("payments API", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
+  let ctx: ReturnType<typeof createTestContext>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    ctx = createTestContext();
   });
 
   afterEach(() => {
-    db.close();
+    closeContext(ctx.db);
   });
 
   const validBody = {
@@ -43,7 +40,7 @@ describe("payments API", () => {
   };
 
   const create = (overrides: Record<string, unknown> = {}) =>
-    request(app)
+    request(ctx.app)
       .post("/api/payments")
       .send({ ...validBody, ...overrides });
 
@@ -77,7 +74,7 @@ describe("payments API", () => {
   });
 
   it("rejects a malformed body with a validation error", async () => {
-    const res = await request(app)
+    const res = await request(ctx.app)
       .post("/api/payments")
       .send({ amount: -1, customerEmail: "nope" });
     expect(res.status).toBe(400);
@@ -88,7 +85,7 @@ describe("payments API", () => {
   it("lists payments newest first", async () => {
     await create({ description: "first" });
     await create({ description: "second" });
-    const res = await request(app).get("/api/payments");
+    const res = await request(ctx.app).get("/api/payments");
     expect(res.status).toBe(200);
     expect(res.body.payments).toHaveLength(2);
     expect(res.body.payments[0].description).toBe("second");
@@ -96,29 +93,27 @@ describe("payments API", () => {
   });
 
   it("returns 404 for an unknown payment", async () => {
-    const res = await request(app).get("/api/payments/pay_missing");
+    const res = await request(ctx.app).get("/api/payments/pay_missing");
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("payment_not_found");
   });
 
   it("exposes a health endpoint", async () => {
-    const res = await request(app).get("/api/health");
+    const res = await request(ctx.app).get("/api/health");
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("ok");
   });
 });
 
 describe("refunds", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
+  let ctx: ReturnType<typeof createTestContext>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    ctx = createTestContext();
   });
 
   afterEach(() => {
-    db.close();
+    closeContext(ctx.db);
   });
 
   const validBody = {
@@ -131,7 +126,7 @@ describe("refunds", () => {
   };
 
   const createPayment = async (overrides: Record<string, unknown> = {}) => {
-    const res = await request(app)
+    const res = await request(ctx.app)
       .post("/api/payments")
       .send({ ...validBody, ...overrides });
     return res.body.id as string;
@@ -140,7 +135,7 @@ describe("refunds", () => {
   it("refunds a succeeded payment in full and blocks double refunds", async () => {
     const id = await createPayment();
 
-    const refund = await request(app).post(`/api/payments/${id}/refund`);
+    const refund = await request(ctx.app).post(`/api/payments/${id}/refund`);
     expect(refund.status).toBe(200);
     expect(refund.body).toMatchObject({
       status: "refunded",
@@ -148,7 +143,7 @@ describe("refunds", () => {
       amountRefundable: 0,
     });
 
-    const again = await request(app).post(`/api/payments/${id}/refund`);
+    const again = await request(ctx.app).post(`/api/payments/${id}/refund`);
     expect(again.status).toBe(409);
     expect(again.body.error).toBe("already_refunded");
   });
@@ -156,7 +151,7 @@ describe("refunds", () => {
   it("applies a partial refund and leaves the balance refundable", async () => {
     const id = await createPayment();
 
-    const refund = await request(app)
+    const refund = await request(ctx.app)
       .post(`/api/payments/${id}/refund`)
       .send({ amount: 1000, reason: "goodwill" });
 
@@ -171,67 +166,65 @@ describe("refunds", () => {
   it("settles at fully refunded after successive partial refunds", async () => {
     const id = await createPayment();
 
-    await request(app).post(`/api/payments/${id}/refund`).send({ amount: 1000 });
-    const second = await request(app).post(`/api/payments/${id}/refund`).send({ amount: 1200 });
+    await request(ctx.app).post(`/api/payments/${id}/refund`).send({ amount: 1000 });
+    const second = await request(ctx.app).post(`/api/payments/${id}/refund`).send({ amount: 1200 });
     expect(second.body).toMatchObject({ status: "partially_refunded", amountRefunded: 2200 });
 
     // Omitting the amount refunds whatever balance is left.
-    const third = await request(app).post(`/api/payments/${id}/refund`);
+    const third = await request(ctx.app).post(`/api/payments/${id}/refund`);
     expect(third.body).toMatchObject({
       status: "refunded",
       amountRefunded: 2500,
       amountRefundable: 0,
     });
 
-    const detail = await request(app).get(`/api/payments/${id}`);
+    const detail = await request(ctx.app).get(`/api/payments/${id}`);
     expect(detail.body.refunds.map((r: { amount: number }) => r.amount)).toEqual([1000, 1200, 300]);
   });
 
   it("rejects a refund larger than the refundable balance", async () => {
     const id = await createPayment();
-    await request(app).post(`/api/payments/${id}/refund`).send({ amount: 2000 });
+    await request(ctx.app).post(`/api/payments/${id}/refund`).send({ amount: 2000 });
 
-    const tooBig = await request(app).post(`/api/payments/${id}/refund`).send({ amount: 900 });
+    const tooBig = await request(ctx.app).post(`/api/payments/${id}/refund`).send({ amount: 900 });
     expect(tooBig.status).toBe(400);
     expect(tooBig.body.error).toBe("refund_amount_too_large");
 
     // The failed refund must not have changed the payment.
-    const detail = await request(app).get(`/api/payments/${id}`);
+    const detail = await request(ctx.app).get(`/api/payments/${id}`);
     expect(detail.body).toMatchObject({ amountRefunded: 2000, status: "partially_refunded" });
   });
 
   it("rejects a non-positive refund amount", async () => {
     const id = await createPayment();
-    const res = await request(app).post(`/api/payments/${id}/refund`).send({ amount: 0 });
+    const res = await request(ctx.app).post(`/api/payments/${id}/refund`).send({ amount: 0 });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("validation_error");
   });
 
   it("will not refund a declined payment", async () => {
     const id = await createPayment({ cardNumber: DECLINE });
-    const refund = await request(app).post(`/api/payments/${id}/refund`);
+    const refund = await request(ctx.app).post(`/api/payments/${id}/refund`);
     expect(refund.status).toBe(409);
     expect(refund.body.error).toBe("cannot_refund_declined");
   });
 
   it("returns 404 when refunding an unknown payment", async () => {
-    const res = await request(app).post("/api/payments/pay_missing/refund");
+    const res = await request(ctx.app).post("/api/payments/pay_missing/refund");
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("payment_not_found");
   });
 });
 
 describe("payment detail and timeline", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
+  let ctx: ReturnType<typeof createTestContext>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    ctx = createTestContext();
   });
 
   afterEach(() => {
-    db.close();
+    closeContext(ctx.db);
   });
 
   const body = {
@@ -242,12 +235,12 @@ describe("payment detail and timeline", () => {
   };
 
   it("records a timeline for a successful payment and its refunds", async () => {
-    const created = await request(app).post("/api/payments").send(body);
+    const created = await request(ctx.app).post("/api/payments").send(body);
     const id = created.body.id;
-    await request(app).post(`/api/payments/${id}/refund`).send({ amount: 500, reason: "late" });
-    await request(app).post(`/api/payments/${id}/refund`);
+    await request(ctx.app).post(`/api/payments/${id}/refund`).send({ amount: 500, reason: "late" });
+    await request(ctx.app).post(`/api/payments/${id}/refund`);
 
-    const detail = await request(app).get(`/api/payments/${id}`);
+    const detail = await request(ctx.app).get(`/api/payments/${id}`);
     expect(detail.status).toBe(200);
     expect(detail.body.events.map((e: { type: string }) => e.type)).toEqual([
       "payment.created",
@@ -261,10 +254,10 @@ describe("payment detail and timeline", () => {
   });
 
   it("records a declined timeline", async () => {
-    const created = await request(app)
+    const created = await request(ctx.app)
       .post("/api/payments")
       .send({ ...body, cardNumber: DECLINE });
-    const detail = await request(app).get(`/api/payments/${created.body.id}`);
+    const detail = await request(ctx.app).get(`/api/payments/${created.body.id}`);
     expect(detail.body.events.map((e: { type: string }) => e.type)).toEqual([
       "payment.created",
       "payment.declined",
@@ -274,12 +267,10 @@ describe("payment detail and timeline", () => {
 });
 
 describe("listing, filtering and pagination", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
+  let ctx: ReturnType<typeof createTestContext>;
 
   beforeEach(async () => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    ctx = createTestContext();
 
     const people = [
       { customerName: "Ada Lovelace", customerEmail: "ada@example.com", description: "Pro plan" },
@@ -287,11 +278,11 @@ describe("listing, filtering and pagination", () => {
       { customerName: "Alan Turing", customerEmail: "alan@example.com", description: "Pro plan" },
     ];
     for (const person of people) {
-      await request(app)
+      await request(ctx.app)
         .post("/api/payments")
         .send({ amount: 1000, cardNumber: VISA, ...person });
     }
-    await request(app).post("/api/payments").send({
+    await request(ctx.app).post("/api/payments").send({
       amount: 5000,
       customerName: "Katherine Johnson",
       customerEmail: "katherine@example.com",
@@ -301,42 +292,42 @@ describe("listing, filtering and pagination", () => {
   });
 
   afterEach(() => {
-    db.close();
+    closeContext(ctx.db);
   });
 
   it("filters by status", async () => {
-    const res = await request(app).get("/api/payments?status=declined");
+    const res = await request(ctx.app).get("/api/payments?status=declined");
     expect(res.body.total).toBe(1);
     expect(res.body.payments[0].customerName).toBe("Katherine Johnson");
   });
 
   it("searches across name, email and description", async () => {
-    const byName = await request(app).get("/api/payments?q=grace");
+    const byName = await request(ctx.app).get("/api/payments?q=grace");
     expect(byName.body.total).toBe(1);
 
-    const byDescription = await request(app).get("/api/payments?q=Pro plan");
+    const byDescription = await request(ctx.app).get("/api/payments?q=Pro plan");
     expect(byDescription.body.total).toBe(2);
 
-    const byEmail = await request(app).get("/api/payments?q=katherine@example.com");
+    const byEmail = await request(ctx.app).get("/api/payments?q=katherine@example.com");
     expect(byEmail.body.total).toBe(1);
   });
 
   it("combines a search term with a status filter", async () => {
     // The term alone matches every payment; the status narrows it to one.
-    const termOnly = await request(app).get("/api/payments?q=example.com");
+    const termOnly = await request(ctx.app).get("/api/payments?q=example.com");
     expect(termOnly.body.total).toBe(4);
 
-    const combined = await request(app).get("/api/payments?q=example.com&status=declined");
+    const combined = await request(ctx.app).get("/api/payments?q=example.com&status=declined");
     expect(combined.body.total).toBe(1);
     expect(combined.body.payments[0].customerName).toBe("Katherine Johnson");
   });
 
   it("paginates with limit and offset while reporting the full total", async () => {
-    const first = await request(app).get("/api/payments?limit=2&offset=0");
+    const first = await request(ctx.app).get("/api/payments?limit=2&offset=0");
     expect(first.body).toMatchObject({ total: 4, limit: 2, offset: 0 });
     expect(first.body.payments).toHaveLength(2);
 
-    const second = await request(app).get("/api/payments?limit=2&offset=2");
+    const second = await request(ctx.app).get("/api/payments?limit=2&offset=2");
     expect(second.body.payments).toHaveLength(2);
 
     const firstIds = first.body.payments.map((p: { id: string }) => p.id);
@@ -345,41 +336,39 @@ describe("listing, filtering and pagination", () => {
   });
 
   it("returns an empty page past the end of the result set", async () => {
-    const res = await request(app).get("/api/payments?limit=2&offset=99");
+    const res = await request(ctx.app).get("/api/payments?limit=2&offset=99");
     expect(res.body.total).toBe(4);
     expect(res.body.payments).toHaveLength(0);
   });
 
   it("rejects an out-of-range limit", async () => {
-    const res = await request(app).get("/api/payments?limit=500");
+    const res = await request(ctx.app).get("/api/payments?limit=500");
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("validation_error");
   });
 
   it("rejects an unknown status filter", async () => {
-    const res = await request(app).get("/api/payments?status=bogus");
+    const res = await request(ctx.app).get("/api/payments?status=bogus");
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("validation_error");
   });
 
   it("treats blank query parameters as absent", async () => {
-    const res = await request(app).get("/api/payments?status=&q=&limit=&offset=");
+    const res = await request(ctx.app).get("/api/payments?status=&q=&limit=&offset=");
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ total: 4, limit: 25, offset: 0 });
   });
 });
 
 describe("idempotent payment creation", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
+  let ctx: ReturnType<typeof createTestContext>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    ctx = createTestContext();
   });
 
   afterEach(() => {
-    db.close();
+    closeContext(ctx.db);
   });
 
   const body = {
@@ -390,11 +379,11 @@ describe("idempotent payment creation", () => {
   };
 
   it("replays the original payment for a repeated key", async () => {
-    const first = await request(app).post("/api/payments").set("Idempotency-Key", "key-1").send(body);
+    const first = await request(ctx.app).post("/api/payments").set("Idempotency-Key", "key-1").send(body);
     expect(first.status).toBe(201);
     expect(first.headers["idempotency-replayed"]).toBe("false");
 
-    const second = await request(app)
+    const second = await request(ctx.app)
       .post("/api/payments")
       .set("Idempotency-Key", "key-1")
       .send(body);
@@ -402,13 +391,13 @@ describe("idempotent payment creation", () => {
     expect(second.headers["idempotency-replayed"]).toBe("true");
     expect(second.body.id).toBe(first.body.id);
 
-    const list = await request(app).get("/api/payments");
+    const list = await request(ctx.app).get("/api/payments");
     expect(list.body.total).toBe(1);
   });
 
   it("rejects a key reused with different parameters", async () => {
-    await request(app).post("/api/payments").set("Idempotency-Key", "key-2").send(body);
-    const conflict = await request(app)
+    await request(ctx.app).post("/api/payments").set("Idempotency-Key", "key-2").send(body);
+    const conflict = await request(ctx.app)
       .post("/api/payments")
       .set("Idempotency-Key", "key-2")
       .send({ ...body, amount: 9900 });
@@ -418,31 +407,29 @@ describe("idempotent payment creation", () => {
   });
 
   it("creates separate payments for different keys", async () => {
-    await request(app).post("/api/payments").set("Idempotency-Key", "key-3").send(body);
-    await request(app).post("/api/payments").set("Idempotency-Key", "key-4").send(body);
-    const list = await request(app).get("/api/payments");
+    await request(ctx.app).post("/api/payments").set("Idempotency-Key", "key-3").send(body);
+    await request(ctx.app).post("/api/payments").set("Idempotency-Key", "key-4").send(body);
+    const list = await request(ctx.app).get("/api/payments");
     expect(list.body.total).toBe(2);
   });
 
   it("creates a new payment every time when no key is supplied", async () => {
-    await request(app).post("/api/payments").send(body);
-    await request(app).post("/api/payments").send(body);
-    const list = await request(app).get("/api/payments");
+    await request(ctx.app).post("/api/payments").send(body);
+    await request(ctx.app).post("/api/payments").send(body);
+    const list = await request(ctx.app).get("/api/payments");
     expect(list.body.total).toBe(2);
   });
 });
 
 describe("stats", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
+  let ctx: ReturnType<typeof createTestContext>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    ctx = createTestContext();
   });
 
   afterEach(() => {
-    db.close();
+    closeContext(ctx.db);
   });
 
   const body = {
@@ -452,7 +439,7 @@ describe("stats", () => {
   };
 
   it("reports zeroes for an empty ledger", async () => {
-    const res = await request(app).get("/api/stats");
+    const res = await request(ctx.app).get("/api/stats");
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
       count: 0,
@@ -464,18 +451,18 @@ describe("stats", () => {
   });
 
   it("reports aggregate stats", async () => {
-    const a = await request(app)
+    const a = await request(ctx.app)
       .post("/api/payments")
       .send({ ...body, amount: 1000 });
-    await request(app)
+    await request(ctx.app)
       .post("/api/payments")
       .send({ ...body, amount: 2000 });
-    await request(app)
+    await request(ctx.app)
       .post("/api/payments")
       .send({ ...body, amount: 500, cardNumber: DECLINE });
-    await request(app).post(`/api/payments/${a.body.id}/refund`);
+    await request(ctx.app).post(`/api/payments/${a.body.id}/refund`);
 
-    const res = await request(app).get("/api/stats");
+    const res = await request(ctx.app).get("/api/stats");
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
       count: 3,
@@ -490,12 +477,12 @@ describe("stats", () => {
   });
 
   it("counts partial refunds against net volume", async () => {
-    const created = await request(app)
+    const created = await request(ctx.app)
       .post("/api/payments")
       .send({ ...body, amount: 4000 });
-    await request(app).post(`/api/payments/${created.body.id}/refund`).send({ amount: 1500 });
+    await request(ctx.app).post(`/api/payments/${created.body.id}/refund`).send({ amount: 1500 });
 
-    const res = await request(app).get("/api/stats");
+    const res = await request(ctx.app).get("/api/stats");
     expect(res.body).toMatchObject({
       count: 1,
       succeededCount: 0,
