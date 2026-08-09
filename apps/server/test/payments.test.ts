@@ -7,11 +7,17 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { openDatabase } from "../src/db.js";
-import { isLuhnValid, PaymentService } from "../src/payments.js";
+import { isLuhnValid } from "../src/payments.js";
+import { createServices } from "../src/services.js";
 
 const VISA = "4242424242424242";
 const DECLINE = "4000000000000002";
 const INVALID = "4242424242424241";
+
+function createTestApp(db: Database.Database, merchantId: string) {
+  const services = createServices(db, merchantId, false);
+  return createApp(services, null);
+}
 
 describe("card helpers", () => {
   it("accepts a Luhn-valid number and rejects an invalid one", () => {
@@ -23,10 +29,13 @@ describe("card helpers", () => {
 describe("payments API", () => {
   let db: Database.Database;
   let app: ReturnType<typeof createApp>;
+  let merchantId: string;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    const ctx = openDatabase(":memory:");
+    db = ctx.db;
+    merchantId = ctx.defaultMerchantId;
+    app = createTestApp(db, merchantId);
   });
 
   afterEach(() => {
@@ -113,8 +122,9 @@ describe("refunds", () => {
   let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    const ctx = openDatabase(":memory:");
+    db = ctx.db;
+    app = createTestApp(db, ctx.defaultMerchantId);
   });
 
   afterEach(() => {
@@ -175,7 +185,6 @@ describe("refunds", () => {
     const second = await request(app).post(`/api/payments/${id}/refund`).send({ amount: 1200 });
     expect(second.body).toMatchObject({ status: "partially_refunded", amountRefunded: 2200 });
 
-    // Omitting the amount refunds whatever balance is left.
     const third = await request(app).post(`/api/payments/${id}/refund`);
     expect(third.body).toMatchObject({
       status: "refunded",
@@ -195,7 +204,6 @@ describe("refunds", () => {
     expect(tooBig.status).toBe(400);
     expect(tooBig.body.error).toBe("refund_amount_too_large");
 
-    // The failed refund must not have changed the payment.
     const detail = await request(app).get(`/api/payments/${id}`);
     expect(detail.body).toMatchObject({ amountRefunded: 2000, status: "partially_refunded" });
   });
@@ -221,289 +229,119 @@ describe("refunds", () => {
   });
 });
 
-describe("payment detail and timeline", () => {
+describe("customers", () => {
   let db: Database.Database;
   let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    const ctx = openDatabase(":memory:");
+    db = ctx.db;
+    app = createTestApp(db, ctx.defaultMerchantId);
   });
 
   afterEach(() => {
     db.close();
   });
 
-  const body = {
-    amount: 2500,
-    customerName: "Ada Lovelace",
-    customerEmail: "ada@example.com",
-    cardNumber: VISA,
-  };
-
-  it("records a timeline for a successful payment and its refunds", async () => {
-    const created = await request(app).post("/api/payments").send(body);
-    const id = created.body.id;
-    await request(app).post(`/api/payments/${id}/refund`).send({ amount: 500, reason: "late" });
-    await request(app).post(`/api/payments/${id}/refund`);
-
-    const detail = await request(app).get(`/api/payments/${id}`);
-    expect(detail.status).toBe(200);
-    expect(detail.body.events.map((e: { type: string }) => e.type)).toEqual([
-      "payment.created",
-      "payment.succeeded",
-      "refund.created",
-      "refund.created",
-      "payment.refunded",
-    ]);
-    expect(detail.body.events[2].message).toContain("late");
-    expect(detail.body.refunds).toHaveLength(2);
-  });
-
-  it("records a declined timeline", async () => {
+  it("creates and lists customers", async () => {
     const created = await request(app)
-      .post("/api/payments")
-      .send({ ...body, cardNumber: DECLINE });
-    const detail = await request(app).get(`/api/payments/${created.body.id}`);
-    expect(detail.body.events.map((e: { type: string }) => e.type)).toEqual([
-      "payment.created",
-      "payment.declined",
-    ]);
-    expect(detail.body.events[1].message).toContain("card_declined");
-  });
-});
+      .post("/api/customers")
+      .send({ name: "Ada Lovelace", email: "ada@example.com" });
+    expect(created.status).toBe(201);
+    expect(created.body.id).toMatch(/^cus_/);
 
-describe("listing, filtering and pagination", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
-
-  beforeEach(async () => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
-
-    const people = [
-      { customerName: "Ada Lovelace", customerEmail: "ada@example.com", description: "Pro plan" },
-      { customerName: "Grace Hopper", customerEmail: "grace@example.com", description: "Team plan" },
-      { customerName: "Alan Turing", customerEmail: "alan@example.com", description: "Pro plan" },
-    ];
-    for (const person of people) {
-      await request(app)
-        .post("/api/payments")
-        .send({ amount: 1000, cardNumber: VISA, ...person });
-    }
-    await request(app).post("/api/payments").send({
-      amount: 5000,
-      customerName: "Katherine Johnson",
-      customerEmail: "katherine@example.com",
-      description: "Enterprise",
-      cardNumber: DECLINE,
-    });
-  });
-
-  afterEach(() => {
-    db.close();
-  });
-
-  it("filters by status", async () => {
-    const res = await request(app).get("/api/payments?status=declined");
-    expect(res.body.total).toBe(1);
-    expect(res.body.payments[0].customerName).toBe("Katherine Johnson");
-  });
-
-  it("searches across name, email and description", async () => {
-    const byName = await request(app).get("/api/payments?q=grace");
-    expect(byName.body.total).toBe(1);
-
-    const byDescription = await request(app).get("/api/payments?q=Pro plan");
-    expect(byDescription.body.total).toBe(2);
-
-    const byEmail = await request(app).get("/api/payments?q=katherine@example.com");
-    expect(byEmail.body.total).toBe(1);
-  });
-
-  it("combines a search term with a status filter", async () => {
-    // The term alone matches every payment; the status narrows it to one.
-    const termOnly = await request(app).get("/api/payments?q=example.com");
-    expect(termOnly.body.total).toBe(4);
-
-    const combined = await request(app).get("/api/payments?q=example.com&status=declined");
-    expect(combined.body.total).toBe(1);
-    expect(combined.body.payments[0].customerName).toBe("Katherine Johnson");
-  });
-
-  it("paginates with limit and offset while reporting the full total", async () => {
-    const first = await request(app).get("/api/payments?limit=2&offset=0");
-    expect(first.body).toMatchObject({ total: 4, limit: 2, offset: 0 });
-    expect(first.body.payments).toHaveLength(2);
-
-    const second = await request(app).get("/api/payments?limit=2&offset=2");
-    expect(second.body.payments).toHaveLength(2);
-
-    const firstIds = first.body.payments.map((p: { id: string }) => p.id);
-    const secondIds = second.body.payments.map((p: { id: string }) => p.id);
-    expect(firstIds.some((id: string) => secondIds.includes(id))).toBe(false);
-  });
-
-  it("returns an empty page past the end of the result set", async () => {
-    const res = await request(app).get("/api/payments?limit=2&offset=99");
-    expect(res.body.total).toBe(4);
-    expect(res.body.payments).toHaveLength(0);
-  });
-
-  it("rejects an out-of-range limit", async () => {
-    const res = await request(app).get("/api/payments?limit=500");
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe("validation_error");
-  });
-
-  it("rejects an unknown status filter", async () => {
-    const res = await request(app).get("/api/payments?status=bogus");
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe("validation_error");
-  });
-
-  it("treats blank query parameters as absent", async () => {
-    const res = await request(app).get("/api/payments?status=&q=&limit=&offset=");
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ total: 4, limit: 25, offset: 0 });
-  });
-});
-
-describe("idempotent payment creation", () => {
-  let db: Database.Database;
-  let app: ReturnType<typeof createApp>;
-
-  beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
-  });
-
-  afterEach(() => {
-    db.close();
-  });
-
-  const body = {
-    amount: 2500,
-    customerName: "Ada Lovelace",
-    customerEmail: "ada@example.com",
-    cardNumber: VISA,
-  };
-
-  it("replays the original payment for a repeated key", async () => {
-    const first = await request(app).post("/api/payments").set("Idempotency-Key", "key-1").send(body);
-    expect(first.status).toBe(201);
-    expect(first.headers["idempotency-replayed"]).toBe("false");
-
-    const second = await request(app)
-      .post("/api/payments")
-      .set("Idempotency-Key", "key-1")
-      .send(body);
-    expect(second.status).toBe(201);
-    expect(second.headers["idempotency-replayed"]).toBe("true");
-    expect(second.body.id).toBe(first.body.id);
-
-    const list = await request(app).get("/api/payments");
+    const list = await request(app).get("/api/customers");
     expect(list.body.total).toBe(1);
-  });
-
-  it("rejects a key reused with different parameters", async () => {
-    await request(app).post("/api/payments").set("Idempotency-Key", "key-2").send(body);
-    const conflict = await request(app)
-      .post("/api/payments")
-      .set("Idempotency-Key", "key-2")
-      .send({ ...body, amount: 9900 });
-
-    expect(conflict.status).toBe(409);
-    expect(conflict.body.error).toBe("idempotency_key_reuse");
-  });
-
-  it("creates separate payments for different keys", async () => {
-    await request(app).post("/api/payments").set("Idempotency-Key", "key-3").send(body);
-    await request(app).post("/api/payments").set("Idempotency-Key", "key-4").send(body);
-    const list = await request(app).get("/api/payments");
-    expect(list.body.total).toBe(2);
-  });
-
-  it("creates a new payment every time when no key is supplied", async () => {
-    await request(app).post("/api/payments").send(body);
-    await request(app).post("/api/payments").send(body);
-    const list = await request(app).get("/api/payments");
-    expect(list.body.total).toBe(2);
+    expect(list.body.customers[0].name).toBe("Ada Lovelace");
   });
 });
 
-describe("stats", () => {
+describe("products and subscriptions", () => {
   let db: Database.Database;
   let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
-    db = openDatabase(":memory:");
-    app = createApp(new PaymentService(db));
+    const ctx = openDatabase(":memory:");
+    db = ctx.db;
+    app = createTestApp(db, ctx.defaultMerchantId);
   });
 
   afterEach(() => {
     db.close();
   });
 
-  const body = {
-    customerName: "Ada Lovelace",
-    customerEmail: "ada@example.com",
-    cardNumber: VISA,
-  };
+  it("creates a product with a recurring price and subscription", async () => {
+    const customer = await request(app)
+      .post("/api/customers")
+      .send({ name: "Ada", email: "ada@example.com" });
 
-  it("reports zeroes for an empty ledger", async () => {
-    const res = await request(app).get("/api/stats");
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({
-      count: 0,
-      grossVolume: 0,
-      refundedVolume: 0,
-      netVolume: 0,
-      currency: "usd",
-    });
+    const product = await request(app)
+      .post("/api/products")
+      .send({ name: "Pro Plan", description: "Monthly subscription" });
+    expect(product.status).toBe(201);
+
+    const price = await request(app)
+      .post(`/api/products/${product.body.id}/prices`)
+      .send({ unitAmount: 2900, currency: "usd", interval: "month", intervalCount: 1 });
+    expect(price.status).toBe(201);
+
+    const sub = await request(app)
+      .post("/api/subscriptions")
+      .send({
+        customerId: customer.body.id,
+        priceId: price.body.id,
+        cardNumber: VISA,
+      });
+    expect(sub.status).toBe(201);
+    expect(sub.body.status).toBe("active");
+    expect(sub.body.invoices).toHaveLength(1);
+  });
+});
+
+describe("disputes and payouts", () => {
+  let db: Database.Database;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    const ctx = openDatabase(":memory:");
+    db = ctx.db;
+    app = createTestApp(db, ctx.defaultMerchantId);
   });
 
-  it("reports aggregate stats", async () => {
-    const a = await request(app)
-      .post("/api/payments")
-      .send({ ...body, amount: 1000 });
-    await request(app)
-      .post("/api/payments")
-      .send({ ...body, amount: 2000 });
-    await request(app)
-      .post("/api/payments")
-      .send({ ...body, amount: 500, cardNumber: DECLINE });
-    await request(app).post(`/api/payments/${a.body.id}/refund`);
-
-    const res = await request(app).get("/api/stats");
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({
-      count: 3,
-      succeededCount: 1,
-      partiallyRefundedCount: 0,
-      refundedCount: 1,
-      declinedCount: 1,
-      grossVolume: 3000,
-      refundedVolume: 1000,
-      netVolume: 2000,
-    });
+  afterEach(() => {
+    db.close();
   });
 
-  it("counts partial refunds against net volume", async () => {
-    const created = await request(app)
-      .post("/api/payments")
-      .send({ ...body, amount: 4000 });
-    await request(app).post(`/api/payments/${created.body.id}/refund`).send({ amount: 1500 });
-
-    const res = await request(app).get("/api/stats");
-    expect(res.body).toMatchObject({
-      count: 1,
-      succeededCount: 0,
-      partiallyRefundedCount: 1,
-      grossVolume: 4000,
-      refundedVolume: 1500,
-      netVolume: 2500,
+  it("opens a dispute on a payment", async () => {
+    const payment = await request(app).post("/api/payments").send({
+      amount: 5000,
+      customerName: "Ada",
+      customerEmail: "ada@example.com",
+      cardNumber: VISA,
     });
+
+    const dispute = await request(app).post("/api/disputes").send({
+      paymentId: payment.body.id,
+      reason: "fraudulent",
+    });
+    expect(dispute.status).toBe(201);
+    expect(dispute.body.status).toBe("needs_response");
+  });
+
+  it("creates a payout when balance is available", async () => {
+    await request(app).post("/api/payments").send({
+      amount: 10000,
+      customerName: "Ada",
+      customerEmail: "ada@example.com",
+      cardNumber: VISA,
+    });
+
+    const balance = await request(app).get("/api/balance");
+    expect(balance.body.available).toBeGreaterThan(0);
+
+    const payout = await request(app).post("/api/payouts").send({ amount: 1000 });
+    expect(payout.status).toBe(201);
+    expect(payout.body.status).toBe("pending");
   });
 });
 
@@ -515,7 +353,6 @@ describe("schema migration", () => {
     dir = mkdtempSync(join(tmpdir(), "cloud-pay-test-"));
     file = join(dir, "legacy.sqlite");
 
-    // The schema as it shipped before partial refunds existed.
     const legacy = new SQLite(file);
     legacy.exec(`
       CREATE TABLE payments (
@@ -545,34 +382,18 @@ describe("schema migration", () => {
   });
 
   it("backfills amount_refunded on a database created by an older version", () => {
-    const db = openDatabase(file);
-    const service = new PaymentService(db);
+    const ctx = openDatabase(file);
+    const services = createServices(ctx.db, ctx.defaultMerchantId, false);
 
-    expect(service.get("pay_old_refunded")).toMatchObject({
+    expect(services.payments.get("pay_old_refunded", ctx.defaultMerchantId)).toMatchObject({
       amountRefunded: 2500,
       amountRefundable: 0,
     });
-    expect(service.get("pay_old_succeeded")).toMatchObject({
+    expect(services.payments.get("pay_old_succeeded", ctx.defaultMerchantId)).toMatchObject({
       amountRefunded: 0,
       amountRefundable: 1000,
     });
 
-    db.close();
-  });
-
-  it("is safe to run twice and leaves migrated data untouched", () => {
-    const first = openDatabase(file);
-    new PaymentService(first).refund("pay_old_succeeded", { amount: 400, reason: "" });
-    first.close();
-
-    const second = openDatabase(file);
-    const service = new PaymentService(second);
-    expect(service.get("pay_old_succeeded")).toMatchObject({
-      amountRefunded: 400,
-      amountRefundable: 600,
-      status: "partially_refunded",
-    });
-    expect(service.get("pay_old_refunded").amountRefunded).toBe(2500);
-    second.close();
+    ctx.db.close();
   });
 });

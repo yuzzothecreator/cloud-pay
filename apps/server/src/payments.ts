@@ -1,16 +1,11 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { customAlphabet } from "nanoid";
 import { z } from "zod";
-import type {
-  PaymentEventRow,
-  PaymentEventType,
-  PaymentRow,
-  PaymentStatus,
-  RefundRow,
-} from "./db.js";
-
-const newId = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 20);
+import type { PaymentEventRow, PaymentEventType, PaymentRow, PaymentStatus, RefundRow } from "./db.js";
+import { AppError } from "./errors.js";
+import { newId } from "./ids.js";
+import type { OutboxService } from "./outbox.js";
+import type { PayoutService } from "./payouts.js";
 
 export const PAYMENT_STATUSES = [
   "succeeded",
@@ -33,6 +28,7 @@ export const createPaymentSchema = z.object({
   description: z.string().trim().max(280).default(""),
   customerName: z.string().trim().min(1, "customerName is required").max(120),
   customerEmail: z.string().trim().email("customerEmail must be a valid email"),
+  customerId: z.string().trim().optional(),
   cardNumber: z
     .string()
     .transform((v) => v.replace(/[\s-]/g, ""))
@@ -48,12 +44,12 @@ export const refundPaymentSchema = z.object({
   reason: z.string().trim().max(280).default(""),
 });
 
-/** Query-string values arrive as strings; blanks mean "filter not applied". */
 const blankToUndefined = (v: unknown) => (v === "" || v === undefined ? undefined : v);
 
 export const listPaymentsQuerySchema = z.object({
   status: z.preprocess(blankToUndefined, z.enum(PAYMENT_STATUSES).optional()),
   q: z.preprocess(blankToUndefined, z.string().trim().max(120).optional()),
+  customerId: z.preprocess(blankToUndefined, z.string().optional()),
   limit: z.preprocess(blankToUndefined, z.coerce.number().int().min(1).max(100).default(25)),
   offset: z.preprocess(blankToUndefined, z.coerce.number().int().min(0).default(0)),
 });
@@ -64,6 +60,8 @@ export type ListPaymentsQuery = z.infer<typeof listPaymentsQuerySchema>;
 
 export interface Payment {
   id: string;
+  merchantId: string;
+  customerId: string | null;
   amount: number;
   currency: string;
   description: string;
@@ -93,7 +91,6 @@ export interface PaymentEvent {
   createdAt: string;
 }
 
-/** A payment with its sub-resources expanded, for the detail view. */
 export interface PaymentDetail extends Payment {
   refunds: Refund[];
   events: PaymentEvent[];
@@ -120,7 +117,6 @@ export interface PaymentStats {
 
 export interface CreatePaymentResult {
   payment: Payment;
-  /** True when an Idempotency-Key replayed a previously stored payment. */
   replayed: boolean;
 }
 
@@ -128,18 +124,14 @@ export interface IdempotencyContext {
   key: string;
 }
 
-export class PaymentError extends Error {
-  constructor(
-    public readonly statusCode: number,
-    message: string,
-    public readonly code: string,
-  ) {
-    super(message);
+/** @deprecated Use AppError */
+export class PaymentError extends AppError {
+  constructor(statusCode: number, message: string, code: string) {
+    super(statusCode, message, code);
     this.name = "PaymentError";
   }
 }
 
-/** Luhn checksum validation for card numbers. */
 export function isLuhnValid(cardNumber: string): boolean {
   let sum = 0;
   let double = false;
@@ -155,7 +147,6 @@ export function isLuhnValid(cardNumber: string): boolean {
   return sum % 10 === 0;
 }
 
-/** Rough card-brand detection from the leading digits. */
 export function detectBrand(cardNumber: string): string {
   if (/^4/.test(cardNumber)) return "visa";
   if (/^5[1-5]/.test(cardNumber) || /^2[2-7]/.test(cardNumber)) return "mastercard";
@@ -168,10 +159,6 @@ export function formatAmount(cents: number, currency: string): string {
   return `${(cents / 100).toFixed(2)} ${currency.toUpperCase()}`;
 }
 
-/**
- * Simulated processor decisions keyed on well-known test card numbers so the
- * demo behaves deterministically without contacting a real payment network.
- */
 const DECLINE_CARDS: Record<string, string> = {
   "4000000000000002": "card_declined",
   "4000000000009995": "insufficient_funds",
@@ -181,6 +168,8 @@ const DECLINE_CARDS: Record<string, string> = {
 function rowToPayment(row: PaymentRow): Payment {
   return {
     id: row.id,
+    merchantId: row.merchant_id,
+    customerId: row.customer_id,
     amount: row.amount,
     currency: row.currency,
     description: row.description,
@@ -215,10 +204,6 @@ function rowToEvent(row: PaymentEventRow): PaymentEvent {
   };
 }
 
-/**
- * Hashes the normalised request so a replayed Idempotency-Key can be checked
- * against the parameters it was first used with.
- */
 function hashCreateInput(input: CreatePaymentInput): string {
   const canonical = JSON.stringify([
     input.amount,
@@ -226,15 +211,24 @@ function hashCreateInput(input: CreatePaymentInput): string {
     input.description,
     input.customerName,
     input.customerEmail,
+    input.customerId ?? null,
     input.cardNumber,
   ]);
   return createHash("sha256").update(canonical).digest("hex");
 }
 
 export class PaymentService {
-  constructor(private readonly db: Database.Database) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly outbox?: OutboxService,
+    private readonly payouts?: PayoutService,
+  ) {}
 
-  create(input: CreatePaymentInput, idempotency?: IdempotencyContext): CreatePaymentResult {
+  create(
+    input: CreatePaymentInput,
+    merchantId: string,
+    idempotency?: IdempotencyContext,
+  ): CreatePaymentResult {
     const requestHash = hashCreateInput(input);
 
     if (idempotency) {
@@ -244,19 +238,28 @@ export class PaymentService {
 
       if (existing) {
         if (existing.request_hash !== requestHash) {
-          throw new PaymentError(
+          throw new AppError(
             409,
             "This Idempotency-Key was already used with different parameters",
             "idempotency_key_reuse",
           );
         }
-        return { payment: this.get(existing.payment_id), replayed: true };
+        return { payment: this.get(existing.payment_id, merchantId), replayed: true };
+      }
+    }
+
+    if (input.customerId) {
+      const customer = this.db
+        .prepare(`SELECT id FROM customers WHERE id = ? AND merchant_id = ?`)
+        .get(input.customerId, merchantId);
+      if (!customer) {
+        throw new AppError(404, "Customer not found", "customer_not_found");
       }
     }
 
     const card = input.cardNumber;
     if (!isLuhnValid(card)) {
-      throw new PaymentError(400, "Card number failed validation", "invalid_card_number");
+      throw new AppError(400, "Card number failed validation", "invalid_card_number");
     }
 
     const brand = detectBrand(card);
@@ -266,7 +269,9 @@ export class PaymentService {
     const createdAt = new Date().toISOString();
 
     const row: PaymentRow = {
-      id: `pay_${newId()}`,
+      id: newId("pay"),
+      merchant_id: merchantId,
+      customer_id: input.customerId ?? null,
       amount: input.amount,
       currency: input.currency,
       description: input.description,
@@ -284,10 +289,10 @@ export class PaymentService {
       this.db
         .prepare(
           `INSERT INTO payments
-            (id, amount, currency, description, customer_name, customer_email,
+            (id, merchant_id, customer_id, amount, currency, description, customer_name, customer_email,
              card_last4, card_brand, status, failure_reason, amount_refunded, created_at)
            VALUES
-            (@id, @amount, @currency, @description, @customer_name, @customer_email,
+            (@id, @merchant_id, @customer_id, @amount, @currency, @description, @customer_name, @customer_email,
              @card_last4, @card_brand, @status, @failure_reason, @amount_refunded, @created_at)`,
         )
         .run(row);
@@ -301,6 +306,7 @@ export class PaymentService {
         this.record(row.id, "payment.declined", `Declined by processor (${declineReason})`);
       } else {
         this.record(row.id, "payment.succeeded", "Authorised and captured by processor");
+        this.payouts?.creditFromPayment(merchantId, row.amount);
       }
 
       if (idempotency) {
@@ -315,16 +321,27 @@ export class PaymentService {
 
     persist();
 
+    const eventType = declineReason ? "payment.declined" : "payment.succeeded";
+    this.outbox?.publish({
+      type: eventType,
+      merchantId,
+      data: { paymentId: row.id, amount: row.amount, status: row.status },
+    });
+
     return { payment: rowToPayment(row), replayed: false };
   }
 
-  list(query: ListPaymentsQuery): PaymentPage {
-    const filters: string[] = [];
-    const params: Record<string, unknown> = {};
+  list(merchantId: string, query: ListPaymentsQuery): PaymentPage {
+    const filters = ["merchant_id = @merchantId"];
+    const params: Record<string, unknown> = { merchantId };
 
     if (query.status) {
       filters.push(`status = @status`);
       params.status = query.status;
+    }
+    if (query.customerId) {
+      filters.push(`customer_id = @customerId`);
+      params.customerId = query.customerId;
     }
     if (query.q) {
       filters.push(
@@ -333,13 +350,12 @@ export class PaymentService {
       params.q = `%${query.q}%`;
     }
 
-    const where = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+    const where = `WHERE ${filters.join(" AND ")}`;
 
     const { total } = this.db
       .prepare(`SELECT COUNT(*) AS total FROM payments ${where}`)
       .get(params) as { total: number };
 
-    // rowid breaks ties between payments created within the same millisecond.
     const rows = this.db
       .prepare(
         `SELECT * FROM payments ${where}
@@ -356,13 +372,12 @@ export class PaymentService {
     };
   }
 
-  get(id: string): Payment {
-    return rowToPayment(this.row(id));
+  get(id: string, merchantId?: string): Payment {
+    return rowToPayment(this.row(id, merchantId));
   }
 
-  /** The payment plus its refunds and event timeline, for the detail view. */
-  getDetail(id: string): PaymentDetail {
-    const payment = rowToPayment(this.row(id));
+  getDetail(id: string, merchantId: string): PaymentDetail {
+    const payment = rowToPayment(this.row(id, merchantId));
     const refunds = this.db
       .prepare(`SELECT * FROM refunds WHERE payment_id = ? ORDER BY rowid ASC`)
       .all(id) as RefundRow[];
@@ -377,28 +392,20 @@ export class PaymentService {
     };
   }
 
-  /**
-   * Refunds all or part of a payment. Omitting `amount` refunds whatever
-   * balance is left, so repeated partial refunds settle exactly at the total.
-   */
-  refund(id: string, input: RefundPaymentInput): Payment {
+  refund(id: string, merchantId: string, input: RefundPaymentInput): Payment {
     const apply = this.db.transaction(() => {
-      const payment = rowToPayment(this.row(id));
+      const payment = rowToPayment(this.row(id, merchantId));
 
       if (payment.status === "declined") {
-        throw new PaymentError(
-          409,
-          "Declined payments cannot be refunded",
-          "cannot_refund_declined",
-        );
+        throw new AppError(409, "Declined payments cannot be refunded", "cannot_refund_declined");
       }
       if (payment.amountRefundable <= 0) {
-        throw new PaymentError(409, "Payment is already refunded", "already_refunded");
+        throw new AppError(409, "Payment is already refunded", "already_refunded");
       }
 
       const amount = input.amount ?? payment.amountRefundable;
       if (amount > payment.amountRefundable) {
-        throw new PaymentError(
+        throw new AppError(
           400,
           `Refund of ${formatAmount(amount, payment.currency)} exceeds the refundable balance of ${formatAmount(payment.amountRefundable, payment.currency)}`,
           "refund_amount_too_large",
@@ -414,7 +421,7 @@ export class PaymentService {
           `INSERT INTO refunds (id, payment_id, amount, reason, created_at)
            VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(`re_${newId()}`, id, amount, input.reason, new Date().toISOString());
+        .run(newId("re"), id, amount, input.reason, new Date().toISOString());
 
       this.db
         .prepare(`UPDATE payments SET amount_refunded = ?, status = ? WHERE id = ?`)
@@ -430,13 +437,21 @@ export class PaymentService {
         this.record(id, "payment.refunded", "Payment fully refunded");
       }
 
-      return rowToPayment(this.row(id));
+      return rowToPayment(this.row(id, merchantId));
     });
 
-    return apply();
+    const result = apply();
+
+    this.outbox?.publish({
+      type: "refund.created",
+      merchantId,
+      data: { paymentId: id, amount: input.amount ?? result.amountRefundable },
+    });
+
+    return result;
   }
 
-  stats(): PaymentStats {
+  stats(merchantId: string): PaymentStats {
     const totals = this.db
       .prepare(
         `SELECT
@@ -447,13 +462,15 @@ export class PaymentService {
            COALESCE(SUM(status = 'declined'), 0) AS declinedCount,
            COALESCE(SUM(CASE WHEN status != 'declined' THEN amount ELSE 0 END), 0) AS grossVolume,
            COALESCE(SUM(amount_refunded), 0) AS refundedVolume
-         FROM payments`,
+         FROM payments WHERE merchant_id = ?`,
       )
-      .get() as Omit<PaymentStats, "netVolume" | "currency">;
+      .get(merchantId) as Omit<PaymentStats, "netVolume" | "currency">;
 
     const latest = this.db
-      .prepare(`SELECT currency FROM payments ORDER BY created_at DESC, rowid DESC LIMIT 1`)
-      .get() as { currency: string } | undefined;
+      .prepare(
+        `SELECT currency FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(merchantId) as { currency: string } | undefined;
 
     return {
       ...totals,
@@ -462,12 +479,14 @@ export class PaymentService {
     };
   }
 
-  private row(id: string): PaymentRow {
-    const row = this.db.prepare(`SELECT * FROM payments WHERE id = ?`).get(id) as
-      | PaymentRow
-      | undefined;
+  private row(id: string, merchantId?: string): PaymentRow {
+    const row = merchantId
+      ? (this.db.prepare(`SELECT * FROM payments WHERE id = ? AND merchant_id = ?`).get(id, merchantId) as
+          | PaymentRow
+          | undefined)
+      : (this.db.prepare(`SELECT * FROM payments WHERE id = ?`).get(id) as PaymentRow | undefined);
     if (!row) {
-      throw new PaymentError(404, `Payment ${id} not found`, "payment_not_found");
+      throw new AppError(404, `Payment ${id} not found`, "payment_not_found");
     }
     return row;
   }
@@ -478,6 +497,6 @@ export class PaymentService {
         `INSERT INTO payment_events (id, payment_id, type, message, created_at)
          VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(`evt_${newId()}`, paymentId, type, message, new Date().toISOString());
+      .run(newId("evt"), paymentId, type, message, new Date().toISOString());
   }
 }

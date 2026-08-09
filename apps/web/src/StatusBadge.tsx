@@ -1,5 +1,25 @@
-import { formatStatus, type PaymentStatus } from "./api.js";
+import { formatStatus } from "./api.js";
 
-export function StatusBadge({ status }: { status: PaymentStatus }) {
-  return <span className={`badge badge-${status}`}>{formatStatus(status)}</span>;
+const KNOWN = new Set([
+  "succeeded",
+  "declined",
+  "partially_refunded",
+  "refunded",
+  "active",
+  "trialing",
+  "past_due",
+  "canceled",
+  "pending",
+  "paid",
+  "delivered",
+  "failed",
+  "needs_response",
+  "under_review",
+  "won",
+  "lost",
+]);
+
+export function StatusBadge({ status }: { status: string }) {
+  const cls = KNOWN.has(status) ? `badge-${status}` : "badge-partially_refunded";
+  return <span className={`badge ${cls}`}>{formatStatus(status)}</span>;
 }
