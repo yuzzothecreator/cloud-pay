@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+coverage/
+*.log
+.DS_Store
+
+# Local runtime data
+apps/server/data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Env files
+.env
+.env.local
