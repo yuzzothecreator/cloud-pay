@@ -1,0 +1,15 @@
+{
+  "name": "cloud-pay",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "server",
+      "command": "npm run dev --workspace apps/server"
+    },
+    {
+      "name": "web",
+      "command": "npm run dev --workspace apps/web"
+    }
+  ],
+  "ports": [4000, 5173]
+}
